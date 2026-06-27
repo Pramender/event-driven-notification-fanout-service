@@ -376,6 +376,19 @@ flowchart LR
 | Cache | Invalidated |
 | Note | Existing `subscription_deliveries` rows are **not** cancelled |
 
+### `POST /v1/subscriptions/{subscriptionId}/replay` — Replay historical events
+
+| Step | Detail |
+|------|--------|
+| Validation | `@Valid`: `from`, `to` required ISO-8601 instants; `from <= to` |
+| Service | `ReplayService.replay(subscriptionId, from, to)` |
+| Scan | `events` where `COALESCE(occurred_at, received_at)` is in `[from, to]` |
+| Filter | Re-evaluates subscription filter per scanned event |
+| Enqueue | No existing delivery → `DeliveryEnqueueService.enqueue()` |
+| Requeue | Existing delivery in `FAILED`, or `SENT` with `AT_LEAST_ONCE` → `requeue()` |
+| Skip | `QUEUED`, `IN_FLIGHT`, `RETRY_PENDING`; `SENT` with `AT_MOST_ONCE` |
+| Response | `202 Accepted` — `eventsScanned`, `matched`, `queued`, `skipped` |
+
 ### Audit APIs
 
 | Endpoint | Query |
@@ -410,7 +423,7 @@ src/main/java/com/eventdriven/notification/fanout/
 | File | API base path | Responsibility |
 |------|---------------|----------------|
 | `EventController.java` | `/v1/events` | HTTP event ingest (`POST`) |
-| `SubscriptionController.java` | `/v1/subscriptions` | Subscription CRUD |
+| `SubscriptionController.java` | `/v1/subscriptions` | Subscription CRUD + replay |
 | `AuditController.java` | `/v1/audit` | Delivery audit queries |
 | `GlobalExceptionHandler.java` | — | Maps exceptions to RFC 7807 `ProblemDetail` responses |
 
@@ -424,6 +437,8 @@ src/main/java/com/eventdriven/notification/fanout/
 | `AcceptEventResponse.java` | `POST /v1/events` response |
 | `CreateSubscriptionRequest.java` | `POST /v1/subscriptions` request body |
 | `SubscriptionResponse.java` | Subscription API responses |
+| `ReplayEventsRequest.java` | `POST /v1/subscriptions/{id}/replay` request body (`from`, `to`) |
+| `ReplayEventsResponse.java` | Replay summary (`eventsScanned`, `matched`, `queued`, `skipped`) |
 | `DeliveryAuditResponse.java` | Audit API responses |
 
 DTOs are REST-layer types only. They are mapped to/from **domain** objects inside application services.
@@ -439,6 +454,7 @@ DTOs are REST-layer types only. They are mapped to/from **domain** objects insid
 | `application/subscription/` | `SubscriptionService.java`, `SubscriptionCache.java` | Subscription CRUD; in-memory subscription cache |
 | `application/delivery/` | `DeliveryOrchestrator.java`, `DeliveryScheduler.java`, `DeliveryStateMachine.java` | Poll queue, dispatch webhooks, manage delivery states |
 | `application/audit/` | `AuditService.java`, `DeliveryAuditView.java` | Read-only delivery history queries |
+| `application/replay/` | `ReplayService.java`, `ReplayResult.java` | Re-enqueue historical events in a time window |
 | `application/filter/` | `FilterEvaluator.java` | JSON filter DSL evaluation |
 | `application/metrics/` | `FanoutMetrics.java` | Micrometer counters/timers |
 | `application/logging/` | `StructuredLog.java`, `LogActions.java`, `LogStatus.java`, `MdcContext.java` | Structured logging helpers |
@@ -573,7 +589,162 @@ flowchart TB
 | `ControllerApiIT.java` | REST API integration tests |
 | `application/filter/FilterEvaluatorTest.java` | Filter DSL unit tests |
 | `application/delivery/DeliveryStateMachineTest.java` | State transition unit tests |
+| `application/ingest/EventIngestServiceTest.java` | Event ingest validation and idempotency |
+| `application/logging/StructuredLogTest.java` | Structured logging MDC behavior |
+| `application/replay/ReplayServiceTest.java` | Replay time-window and delivery-mode logic |
 | `domain/RetryPolicyTest.java` | Backoff calculation unit tests |
+| `domain/WebhookTargetTest.java` | Webhook target validation |
+| `infrastructure/web/GlobalExceptionHandlerTest.java` | RFC 7807 error mapping |
+
+See **[Test coverage — scenarios](#test-coverage--scenarios)** below for every test method.
+
+---
+
+## Test coverage — scenarios
+
+Every automated test scenario in `src/test/java/`, grouped by test class. Integration tests (IT) exercise real PostgreSQL (Testcontainers), Kafka bootstrap wiring, and WireMock webhook stubs unless noted.
+
+### Unit tests
+
+#### `application/filter/FilterEvaluatorTest.java`
+
+| Test method | Verifies |
+|-------------|----------|
+| `matchesTypeAndPayloadConditions` | `all` composition with `type eq` and `payload.amount gte` matches when both hold |
+| `rejectsWhenSourceNotInList` | `source in` returns false when source is not in the allowed list |
+| `supportsAnyComposition` | `any` matches when at least one branch is true |
+| `nullFilterMatchesAll` | Null filter matches every event |
+| `rejectsUnsupportedOperator` | Unknown `op` (e.g. `regex`) throws `FilterEvaluationException` |
+| `rejectsUnknownField` | Field other than `type`, `source`, or `payload.*` throws |
+| `rejectsNumericComparisonOnNonNumericValues` | `gte`/`gt`/`lte`/`lt` on non-numeric payload values throws |
+| `rejectsMissingConditionField` | Condition without `field` throws with “missing field” |
+
+#### `application/delivery/DeliveryStateMachineTest.java`
+
+| Test method | Verifies |
+|-------------|----------|
+| `allowsValidTransitions` | `QUEUED→IN_FLIGHT`, `IN_FLIGHT→SENT`, `IN_FLIGHT→RETRY_PENDING` are allowed |
+| `rejectsInvalidTransition` | `SENT→IN_FLIGHT` throws `IllegalStateTransitionException` |
+| `identifiesTerminalStates` | `SENT` and `FAILED` are terminal; `QUEUED` is not |
+
+#### `domain/RetryPolicyTest.java`
+
+| Test method | Verifies |
+|-------------|----------|
+| `computesBackoffWithinBounds` | Backoff for attempt 3 is in `[0, maxBackoffMs]` (full jitter) |
+| `appliesDefaultsForInvalidValues` | Negative `initialBackoffMs` and multiplier `< 1` are clamped to defaults |
+| `rejectsNonPositiveMaxAttempts` | `maxAttempts` ≤ 0 throws `IllegalArgumentException` |
+
+#### `application/logging/StructuredLogTest.java`
+
+| Test method | Verifies |
+|-------------|----------|
+| `emitsActionStatusAndFieldsWithoutLeakingMdc` | Log line includes `action`, `status`, custom fields, and `deliveryId` in MDC; structured fields do not leak into caller MDC after log |
+
+#### `application/ingest/EventIngestServiceTest.java`
+
+| Test method | Verifies |
+|-------------|----------|
+| `acceptsValidJsonEvent` | Valid JSON persists event, invokes fanout, increments `events.accepted` metric |
+| `returnsExistingEventOnDuplicateId` | Duplicate `event_id` returns existing row without save or fanout |
+| `rejectsInvalidJson` | Malformed JSON throws `EventValidationException`; records `invalid_json` metric |
+| `rejectsMissingPayload` | Missing `payload` throws; records `missing_payload` metric |
+| `rejectsNonObjectPayload` | String `payload` throws validation error |
+| `rejectsMissingType` | Missing `type` throws; records `missing_type` metric |
+| `rejectsBlankSource` | Blank `source` throws; records `missing_source` metric |
+| `rejectsInvalidEventId` | Non-UUID `event_id` throws; records `invalid_event_id` metric |
+| `acceptsTypedRequestAndPersists` | `AcceptEventRequest` DTO path saves correct entity and triggers fanout |
+
+#### `application/replay/ReplayServiceTest.java`
+
+| Test method | Verifies |
+|-------------|----------|
+| `replaysMatchingEventsWithoutExistingDeliveries` | Events in window matching filter with no prior delivery are enqueued |
+| `skipsEventsThatDoNotMatchFilter` | Non-matching events are not enqueued |
+| `requeuesPreviouslySentEventsForAtLeastOnce` | `AT_LEAST_ONCE` requeues existing `SENT` delivery via `requeue()` |
+| `skipsAlreadySentEventsForAtMostOnce` | `AT_MOST_ONCE` skips events already `SENT` |
+| `skipsDeliveriesAlreadyInProgress` | Existing `QUEUED` delivery is skipped (not double-enqueued) |
+| `requeuesPreviouslyFailedDeliveries` | `FAILED` deliveries are requeued |
+| `rejectsInvalidTimeRange` | `from > to` or null bounds throw `ReplayValidationException` |
+| `propagatesMissingSubscription` | Unknown subscription ID throws `ResourceNotFoundException` |
+
+#### `domain/WebhookTargetTest.java`
+
+| Test method | Verifies |
+|-------------|----------|
+| `acceptsValidTarget` | URL, headers, and timeout are stored as provided |
+| `defaultsTimeoutWhenNonPositive` | Timeout ≤ 0 defaults to 5000 ms; null headers become empty map |
+| `rejectsBlankUrl` | Blank URL throws `IllegalArgumentException` |
+
+#### `infrastructure/web/GlobalExceptionHandlerTest.java`
+
+| Test method | Verifies |
+|-------------|----------|
+| `mapsResourceNotFoundTo404` | `ResourceNotFoundException` → 404 ProblemDetail with resource id |
+| `mapsEventValidationTo400` | `EventValidationException` → 400 “Invalid event” |
+| `mapsFilterEvaluationTo400` | `FilterEvaluationException` → 400 “Invalid subscription filter” |
+| `mapsReplayValidationTo400` | `ReplayValidationException` → 400 “Invalid replay request” |
+| `mapsBeanValidationTo400WithFieldDetails` | `@Valid` failures → 400 with field-level detail |
+| `mapsTypeMismatchTo400` | Invalid query/path enum (e.g. audit `status`) → 400 |
+| `mapsIllegalArgumentTo400` | `IllegalArgumentException` → 400 “Invalid request” |
+| `mapsUnreadableBodyTo400` | Unparseable JSON body → 400 “Invalid request body” |
+| `mapsFanoutServiceExceptionTo422` | `FanoutServiceException` → 422 “Processing error” |
+| `mapsUnexpectedExceptionTo500WithoutLeakingDetails` | Generic exception → 500 without internal message leak |
+
+### Integration tests
+
+#### `ControllerApiIT.java`
+
+Spring Boot web test with Testcontainers PostgreSQL + Kafka, WireMock webhook server, and classpath samples under `src/test/resources/api-samples/`. Delivery scheduler interval is disabled (60s); tests call `DeliveryOrchestrator.processReadyDeliveries()` explicitly.
+
+| Test method | Verifies (end-to-end) |
+|-------------|----------------------|
+| `allControllerEndpointsWithThreeConsumersAndEvents` | Full REST happy path: create three subscriptions from JSON samples; GET one and list all; POST four sample events (high/low order, payment, inventory); duplicate event returns 202 idempotently; invalid event returns 400; manual dispatch delivers to three WireMock consumers (consumer-1 not called for low-value order); audit by event/subscription/delivery returns `SENT` with HTTP 200 attempts; filter mismatch yields empty audits; soft-delete removes subscription from list |
+| `subscriptionNotFoundReturns404` | GET unknown subscription → 404 |
+| `errorResponsesReturnProblemDetails` | Malformed JSON, missing `type`, invalid `event_id`, missing subscription `name`, blank webhook URL, invalid retry policy, DELETE missing subscription, audit missing delivery, invalid audit `status` query — all return appropriate 400/404 ProblemDetail bodies |
+| `invalidSubscriptionFilterFailsEventAcceptance` | Subscription with unsupported filter op is created, but matching event ingest fails 400 with filter error (fanout evaluates at ingest time) |
+| `permanentWebhookFailureSurfacesInAudit` | Webhook returning 400 → delivery reaches terminal `FAILED` with attempt HTTP 400 in audit |
+| `replayApiAcceptsTimeRangeAndRedeliversEvents` | POST `/v1/subscriptions/{id}/replay` with time range re-enqueues matched event; second webhook delivery occurs |
+| `replayApiReturnsProblemDetailsForInvalidRequests` | Replay on missing subscription → 404; inverted time range or empty body → 400 |
+
+#### `FanoutIntegrationIT.java`
+
+Spring Boot integration test with Testcontainers PostgreSQL + Kafka and WireMock. Uses application services directly (not HTTP controllers). Kafka listener auto-start disabled.
+
+| Test method | Verifies (end-to-end) |
+|-------------|----------------------|
+| `endToEndEventFanoutDeliveryAndAudit` | Create subscription → ingest event via `EventIngestService` → dispatch → webhook 200 → audit shows `SENT` with attempt record |
+| `fifoOrderMaintainedPerSubscription` | Two events enqueued; first webhook 503 then 200; second event not delivered until head completes — three total POSTs in order |
+| `noMatchingSubscriptionProducesNoDeliveries` | Non-matching event produces no webhook call and empty audit |
+| `retryableWebhookFailureEventuallySucceeds` | 503 then 200 on retry → final `SENT` with ≥ 2 attempts |
+| `replayRequeuesHistoricalEventsInTimeRange` | `ReplayService.replay()` scans events in window, requeues one matching event (skips wrong type), second webhook delivery occurs |
+
+---
+
+## Manual API smoke test (`api-samples`)
+
+**Script:** `src/test/resources/api-samples/manual-curls.sh`
+
+Run against a live stack (`docker compose up` or local `mvn spring-boot:run`) with `WEBHOOK_BASE` set to a reachable webhook URL (e.g. [webhook.site](https://webhook.site) or WireMock). The script:
+
+1. Creates three subscriptions from `api-samples/subscriptions/` (order, payment, inventory filters).
+2. Posts sample events from `api-samples/events/`.
+3. Waits for the delivery scheduler, then queries audit APIs by event, subscription, and delivery.
+4. Calls **`POST /v1/subscriptions/{subscriptionId}/replay`** for consumer 1 (`ID1`) with a time window covering sample `occurred_at` values (`2026-06-27T00:00:00Z` through now UTC), prints `eventsScanned`, `matched`, `queued`, `skipped`, waits for delivery, and re-audits `EVENT1`.
+
+### Replay step (consumer 1)
+
+| Input | Value |
+|-------|-------|
+| Subscription | `consumer-1-order-alerts.json` (`AT_LEAST_ONCE`) |
+| Event | `order-created-high-value.json` (`EVENT1`, amount 250) |
+| Time window | `from`: start of sample day; `to`: now (UTC) |
+| Expected replay | `matched: 1`, `queued: 1` (requeues prior `SENT` delivery) |
+| Audit after replay | Additional delivery attempt on `EVENT1` |
+
+**What this demonstrates:** replay is a **backfill / re-delivery** path over historical rows in `events`, not a re-ingest of Kafka/HTTP payloads. `ReplayService` scans events whose effective timestamp falls in `[from, to]`, applies the subscription filter, then enqueues missing deliveries or `requeue()` existing ones depending on status and `deliveryMode`. Low-value orders and non-matching types in the window are not queued for consumer 1; `AT_MOST_ONCE` + `SENT` deliveries are skipped (see `ReplayServiceTest` and consumer 3 in integration tests).
+
+**Automated coverage:** replay is covered by `ReplayServiceTest`, `ControllerApiIT.replayApiAcceptsTimeRangeAndRedeliversEvents`, and `FanoutIntegrationIT.replayRequeuesHistoricalEventsInTimeRange`.
 
 ---
 

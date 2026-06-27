@@ -96,4 +96,19 @@ DELIVERY_ID=$(curl -s "$API/v1/audit/events/$EVENT1" | jq -r '.[0].deliveryId')
 echo "==> Audit by delivery $DELIVERY_ID"
 curl -s "$API/v1/audit/deliveries/$DELIVERY_ID" | jq .
 
+echo "==> Replay historical events for consumer 1 (order-alerts, AT_LEAST_ONCE)"
+# Sample events set occurred_at on 2026-06-27; window covers that day through now (UTC).
+REPLAY_FROM="2026-06-27T00:00:00Z"
+REPLAY_TO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+REPLAY=$(curl -s -X POST "$API/v1/subscriptions/$ID1/replay" \
+  -H 'Content-Type: application/json' \
+  -d "{\"from\": \"$REPLAY_FROM\", \"to\": \"$REPLAY_TO\"}")
+echo "$REPLAY" | jq '{eventsScanned, matched, queued, skipped}'
+
+echo "==> Waiting 5s for replay delivery..."
+sleep 5
+
+echo "==> Audit by event after replay (order) — expect another attempt for AT_LEAST_ONCE"
+curl -s "$API/v1/audit/events/$EVENT1" | jq .
+
 echo "==> Done. Subscription IDs: $ID1, $ID2, $ID3"
