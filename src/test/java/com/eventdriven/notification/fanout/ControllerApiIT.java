@@ -181,6 +181,196 @@ class ControllerApiIT {
         assertThat(getSubscriptionStatus(missing)).isEqualTo(HttpStatus.NOT_FOUND);
     }
 
+    @Test
+    void errorResponsesReturnProblemDetails() throws Exception {
+        ResponseEntity<String> malformed = restTemplate.exchange(
+                apiUrl("/v1/events"),
+                HttpMethod.POST,
+                jsonEntity("{not-json"),
+                String.class);
+        assertThat(malformed.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(malformed.getBody()).contains("Invalid request body");
+
+        ResponseEntity<String> missingType = restTemplate.exchange(
+                apiUrl("/v1/events"),
+                HttpMethod.POST,
+                jsonEntity("""
+                        { "source": "orders-api", "payload": {} }
+                        """),
+                String.class);
+        assertThat(missingType.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(missingType.getBody()).contains("Validation failed");
+        assertThat(missingType.getBody()).contains("type");
+
+        ResponseEntity<String> invalidEventId = restTemplate.exchange(
+                apiUrl("/v1/events"),
+                HttpMethod.POST,
+                jsonEntity("""
+                        {
+                          "event_id": "not-a-uuid",
+                          "type": "order.created",
+                          "source": "orders-api",
+                          "payload": {}
+                        }
+                        """),
+                String.class);
+        assertThat(invalidEventId.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(invalidEventId.getBody()).contains("Invalid request body");
+
+        ResponseEntity<String> missingName = restTemplate.exchange(
+                apiUrl("/v1/subscriptions"),
+                HttpMethod.POST,
+                jsonEntity("""
+                        {
+                          "deliveryMode": "AT_LEAST_ONCE",
+                          "filter": { "all": [] },
+                          "target": { "url": "http://localhost:1/hook", "timeoutMs": 1000 },
+                          "retryPolicy": { "maxAttempts": 3, "initialBackoffMs": 100, "maxBackoffMs": 500, "multiplier": 2.0 }
+                        }
+                        """),
+                String.class);
+        assertThat(missingName.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(missingName.getBody()).contains("name");
+
+        ResponseEntity<String> blankWebhookUrl = restTemplate.exchange(
+                apiUrl("/v1/subscriptions"),
+                HttpMethod.POST,
+                jsonEntity("""
+                        {
+                          "name": "bad-target",
+                          "deliveryMode": "AT_LEAST_ONCE",
+                          "filter": { "all": [] },
+                          "target": { "url": "  ", "timeoutMs": 1000 },
+                          "retryPolicy": { "maxAttempts": 3, "initialBackoffMs": 100, "maxBackoffMs": 500, "multiplier": 2.0 }
+                        }
+                        """),
+                String.class);
+        assertThat(blankWebhookUrl.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(blankWebhookUrl.getBody()).contains("Webhook URL is required");
+
+        ResponseEntity<String> invalidRetryPolicy = restTemplate.exchange(
+                apiUrl("/v1/subscriptions"),
+                HttpMethod.POST,
+                jsonEntity("""
+                        {
+                          "name": "bad-retry",
+                          "deliveryMode": "AT_LEAST_ONCE",
+                          "filter": { "all": [] },
+                          "target": { "url": "http://localhost:1/hook", "timeoutMs": 1000 },
+                          "retryPolicy": { "maxAttempts": 0, "initialBackoffMs": 100, "maxBackoffMs": 500, "multiplier": 2.0 }
+                        }
+                        """),
+                String.class);
+        assertThat(invalidRetryPolicy.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(invalidRetryPolicy.getBody()).contains("maxAttempts");
+
+        UUID missingSubscription = UUID.randomUUID();
+        ResponseEntity<String> deleteMissing = restTemplate.exchange(
+                apiUrl("/v1/subscriptions/" + missingSubscription),
+                HttpMethod.DELETE,
+                HttpEntity.EMPTY,
+                String.class);
+        assertThat(deleteMissing.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(deleteMissing.getBody()).contains("Subscription not found");
+
+        UUID missingDelivery = UUID.randomUUID();
+        ResponseEntity<String> auditMissingDelivery = restTemplate.getForEntity(
+                apiUrl("/v1/audit/deliveries/" + missingDelivery),
+                String.class);
+        assertThat(auditMissingDelivery.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(auditMissingDelivery.getBody()).contains("Delivery not found");
+
+        SubscriptionResponse subscription = createSubscription("subscriptions/consumer-1-order-alerts.json");
+        ResponseEntity<String> invalidStatus = restTemplate.getForEntity(
+                apiUrl("/v1/audit/subscriptions/" + subscription.subscriptionId() + "?status=NOT_A_STATUS"),
+                String.class);
+        assertThat(invalidStatus.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(invalidStatus.getBody()).contains("status");
+    }
+
+    @Test
+    void invalidSubscriptionFilterFailsEventAcceptance() throws Exception {
+        String body = """
+                {
+                  "name": "bad-filter",
+                  "deliveryMode": "AT_LEAST_ONCE",
+                  "filter": { "all": [ { "field": "type", "op": "regex", "value": ".*" } ] },
+                  "target": { "url": "%s/hook", "timeoutMs": 3000 },
+                  "retryPolicy": { "maxAttempts": 3, "initialBackoffMs": 100, "maxBackoffMs": 500, "multiplier": 2.0 }
+                }
+                """.formatted("http://localhost:" + webhookServer.port());
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        ResponseEntity<String> createResponse = restTemplate.exchange(
+                apiUrl("/v1/subscriptions"),
+                HttpMethod.POST,
+                new HttpEntity<>(body, headers),
+                String.class);
+        assertThat(createResponse.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        ResponseEntity<String> eventResponse = restTemplate.exchange(
+                apiUrl("/v1/events"),
+                HttpMethod.POST,
+                jsonEntity("""
+                        {
+                          "type": "order.created",
+                          "source": "orders-api",
+                          "payload": { "amount": 200 }
+                        }
+                        """),
+                String.class);
+        assertThat(eventResponse.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(eventResponse.getBody()).contains("Invalid subscription filter");
+        assertThat(eventResponse.getBody()).contains("Unsupported filter op");
+    }
+
+    @Test
+    void permanentWebhookFailureSurfacesInAudit() throws Exception {
+        webhookServer.resetAll();
+        stubFor(post(urlEqualTo("/fail-400"))
+                .willReturn(aResponse().withStatus(400)));
+
+        String body = """
+                {
+                  "name": "fail-hook",
+                  "deliveryMode": "AT_LEAST_ONCE",
+                  "filter": { "all": [ { "field": "type", "op": "eq", "value": "fail.test" } ] },
+                  "target": { "url": "%s/fail-400", "timeoutMs": 3000 },
+                  "retryPolicy": { "maxAttempts": 3, "initialBackoffMs": 10, "maxBackoffMs": 50, "multiplier": 2.0 }
+                }
+                """.formatted("http://localhost:" + webhookServer.port());
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        ResponseEntity<SubscriptionResponse> createResponse = restTemplate.exchange(
+                apiUrl("/v1/subscriptions"),
+                HttpMethod.POST,
+                new HttpEntity<>(body, headers),
+                SubscriptionResponse.class);
+        assertThat(createResponse.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        AcceptEventResponse event = postEventRawSuccess("""
+                {
+                  "type": "fail.test",
+                  "source": "test",
+                  "payload": {}
+                }
+                """);
+
+        await().untilAsserted(() -> {
+            deliveryOrchestrator.processReadyDeliveries();
+            List<DeliveryAuditResponse> audits = auditByEvent(event.eventId());
+            assertThat(audits).hasSize(1);
+            assertThat(audits.getFirst().finalStatus()).isEqualTo(DeliveryStatus.FAILED);
+            assertThat(audits.getFirst().attempts()).isNotEmpty();
+            assertThat(audits.getFirst().attempts().getFirst().httpStatus()).isEqualTo(400);
+        });
+
+        List<DeliveryAuditResponse> failed = auditBySubscription(
+                createResponse.getBody().subscriptionId(), "FAILED");
+        assertThat(failed).hasSize(1);
+        assertThat(failed.getFirst().eventId()).isEqualTo(event.eventId());
+    }
+
     private SubscriptionResponse createSubscription(String samplePath) throws IOException {
         String body = loadSample(samplePath);
         HttpHeaders headers = new HttpHeaders();
@@ -242,6 +432,16 @@ class ControllerApiIT {
                 HttpMethod.POST,
                 jsonEntity(loadSample(samplePath)),
                 String.class);
+    }
+
+    private AcceptEventResponse postEventRawSuccess(String body) {
+        ResponseEntity<AcceptEventResponse> response = restTemplate.exchange(
+                apiUrl("/v1/events"),
+                HttpMethod.POST,
+                jsonEntity(body),
+                AcceptEventResponse.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+        return response.getBody();
     }
 
     private List<DeliveryAuditResponse> auditByEvent(UUID eventId) {

@@ -142,7 +142,7 @@ public class EventIngestService {
         }
 
         UUID eventId = root.hasNonNull("event_id")
-                ? UUID.fromString(root.get("event_id").asText())
+                ? parseEventId(root.get("event_id").asText())
                 : UUID.randomUUID();
 
         Instant occurredAt = parseOccurredAt(root);
@@ -169,6 +169,15 @@ public class EventIngestService {
             return Instant.ofEpochMilli(epochMillis);
         }
         return Instant.parse(node.asText());
+    }
+
+    private UUID parseEventId(String raw) {
+        try {
+            return UUID.fromString(raw);
+        } catch (IllegalArgumentException ex) {
+            metrics.eventInvalid("invalid_event_id");
+            throw new EventValidationException("Invalid event_id: must be a UUID");
+        }
     }
 
     private String requiredText(JsonNode node, String field) {

@@ -165,4 +165,70 @@ class FanoutIntegrationIT {
         deliveryOrchestrator.processReadyDeliveries();
         await().untilAsserted(() -> verify(3, postRequestedFor(urlEqualTo("/fifo"))));
     }
+
+    @Test
+    void noMatchingSubscriptionProducesNoDeliveries() throws Exception {
+        webhookServer.resetAll();
+        stubFor(post(urlMatching("/hook.*"))
+                .willReturn(aResponse().withStatus(200)));
+
+        var filter = objectMapper.readTree("""
+                { "all": [ { "field": "type", "op": "eq", "value": "never.match" } ] }
+                """);
+        subscriptionService.create(
+                "no-match",
+                DeliveryMode.AT_LEAST_ONCE,
+                filter,
+                new WebhookTarget("http://localhost:" + webhookServer.port() + "/hook-nomatch", Map.of(), 3000),
+                new RetryPolicy(3, 100, 500, 2.0)
+        );
+
+        var event = ingestService.acceptEvent("""
+                { "type": "other.type", "source": "test", "payload": {} }
+                """);
+
+        deliveryOrchestrator.processReadyDeliveries();
+        verify(0, postRequestedFor(urlEqualTo("/hook-nomatch")));
+        assertThat(auditService.byEvent(event.eventId())).isEmpty();
+    }
+
+    @Test
+    void retryableWebhookFailureEventuallySucceeds() throws Exception {
+        webhookServer.resetAll();
+        stubFor(post(urlEqualTo("/retry-hook"))
+                .inScenario("retry")
+                .whenScenarioStateIs("Started")
+                .willReturn(aResponse().withStatus(503))
+                .willSetStateTo("FailedOnce"));
+        stubFor(post(urlEqualTo("/retry-hook"))
+                .inScenario("retry")
+                .whenScenarioStateIs("FailedOnce")
+                .willReturn(aResponse().withStatus(200)));
+
+        var filter = objectMapper.readTree("""
+                { "all": [ { "field": "type", "op": "eq", "value": "retry.test" } ] }
+                """);
+        subscriptionService.create(
+                "retry-sub",
+                DeliveryMode.AT_LEAST_ONCE,
+                filter,
+                new WebhookTarget("http://localhost:" + webhookServer.port() + "/retry-hook", Map.of(), 3000),
+                new RetryPolicy(5, 10, 100, 2.0)
+        );
+
+        var event = ingestService.acceptEvent("""
+                { "type": "retry.test", "source": "test", "payload": {} }
+                """);
+
+        deliveryOrchestrator.processReadyDeliveries();
+        await().untilAsserted(() -> verify(1, postRequestedFor(urlEqualTo("/retry-hook"))));
+
+        deliveryOrchestrator.processReadyDeliveries();
+        await().untilAsserted(() -> {
+            List<DeliveryAuditView> audit = auditService.byEvent(event.eventId());
+            assertThat(audit).hasSize(1);
+            assertThat(audit.getFirst().finalStatus()).isEqualTo(DeliveryStatus.SENT);
+            assertThat(audit.getFirst().attempts()).hasSizeGreaterThanOrEqualTo(2);
+        });
+    }
 }

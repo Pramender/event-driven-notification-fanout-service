@@ -9,10 +9,14 @@ import org.slf4j.LoggerFactory;
 import org.slf4j.event.Level;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+
+import java.util.stream.Collectors;
 
 /**
  * Maps application exceptions to RFC 7807 {@link ProblemDetail} responses.
@@ -55,8 +59,27 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ProblemDetail handleBeanValidation(MethodArgumentNotValidException ex) {
+        String fieldErrors = ex.getBindingResult().getFieldErrors().stream()
+                .map(this::formatFieldError)
+                .collect(Collectors.joining("; "));
         ProblemDetail detail = ProblemDetail.forStatus(HttpStatus.BAD_REQUEST);
         detail.setTitle("Validation failed");
+        detail.setDetail(fieldErrors.isBlank() ? "Request validation failed" : fieldErrors);
+        return detail;
+    }
+
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ProblemDetail handleUnreadableBody(HttpMessageNotReadableException ex) {
+        ProblemDetail detail = ProblemDetail.forStatus(HttpStatus.BAD_REQUEST);
+        detail.setTitle("Invalid request body");
+        detail.setDetail(extractReadableCause(ex));
+        return detail;
+    }
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ProblemDetail handleIllegalArgument(IllegalArgumentException ex) {
+        ProblemDetail detail = ProblemDetail.forStatus(HttpStatus.BAD_REQUEST);
+        detail.setTitle("Invalid request");
         detail.setDetail(ex.getMessage());
         return detail;
     }
@@ -99,5 +122,21 @@ public class GlobalExceptionHandler {
         detail.setTitle("Internal server error");
         detail.setDetail("An unexpected error occurred");
         return detail;
+    }
+
+    private String formatFieldError(FieldError error) {
+        return error.getField() + ": " + error.getDefaultMessage();
+    }
+
+    private String extractReadableCause(HttpMessageNotReadableException ex) {
+        Throwable cause = ex.getCause();
+        if (cause != null && cause.getMessage() != null && !cause.getMessage().isBlank()) {
+            return cause.getMessage();
+        }
+        String message = ex.getMessage();
+        if (message != null && message.contains(":")) {
+            return message.substring(message.indexOf(':') + 1).trim();
+        }
+        return "Malformed JSON request body";
     }
 }
