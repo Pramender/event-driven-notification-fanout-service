@@ -19,6 +19,7 @@ import io.micrometer.tracing.Span;
 import io.micrometer.tracing.Tracer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -45,6 +46,7 @@ public class DeliveryOrchestrator {
     private final FanoutMetrics metrics;
     private final Timer deliveryLatencyTimer;
     private final Tracer tracer;
+    private final DeliveryOrchestrator self;
 
     public DeliveryOrchestrator(
             SubscriptionDeliveryJpaRepository deliveryRepository,
@@ -56,7 +58,8 @@ public class DeliveryOrchestrator {
             EntityMapper mapper,
             FanoutMetrics metrics,
             Timer deliveryLatencyTimer,
-            Tracer tracer) {
+            Tracer tracer,
+            @Lazy DeliveryOrchestrator self) {
         this.deliveryRepository = deliveryRepository;
         this.cursorRepository = cursorRepository;
         this.attemptRepository = attemptRepository;
@@ -67,6 +70,7 @@ public class DeliveryOrchestrator {
         this.metrics = metrics;
         this.deliveryLatencyTimer = deliveryLatencyTimer;
         this.tracer = tracer;
+        this.self = self;
     }
 
     /**
@@ -77,7 +81,7 @@ public class DeliveryOrchestrator {
                 deliveryRepository.findReadyForDispatch(Instant.now(), BATCH_SIZE);
         for (SubscriptionDeliveryEntity delivery : ready) {
             try {
-                dispatchDelivery(delivery.getDeliveryId());
+                self.dispatchDelivery(delivery.getDeliveryId());
             } catch (Exception ex) {
                 log.error("Unexpected error dispatching deliveryId={}", delivery.getDeliveryId(), ex);
             }

@@ -38,7 +38,7 @@ services:
       retries: 10
 
   jaeger:
-    image: jaegertracing/all-in-one:1.62
+    image: jaegertracing/all-in-one:1.61
     ports:
       - "16686:16686"
       - "4318:4318"
@@ -56,6 +56,7 @@ services:
       DB_USER: fanout
       DB_PASSWORD: fanout
       KAFKA_BOOTSTRAP: kafka:9092
+      MANAGEMENT_TRACING_ENABLED: "true"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
     depends_on:
       postgres:
