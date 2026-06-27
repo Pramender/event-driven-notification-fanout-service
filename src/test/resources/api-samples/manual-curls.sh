@@ -96,10 +96,19 @@ DELIVERY_ID=$(curl -s "$API/v1/audit/events/$EVENT1" | jq -r '.[0].deliveryId')
 echo "==> Audit by delivery $DELIVERY_ID"
 curl -s "$API/v1/audit/deliveries/$DELIVERY_ID" | jq .
 
+echo "==> Core smoke tests complete. Subscription IDs: $ID1, $ID2, $ID3"
+
 echo "==> Replay historical events for consumer 1 (order-alerts, AT_LEAST_ONCE)"
-# Sample events set occurred_at on 2026-06-27; window covers that day through now (UTC).
+# Replay runs last so ingest, delivery, and audit checks above are settled first.
+# Sample events set occurred_at on 2026-06-27 (latest 10:15 UTC).
 REPLAY_FROM="2026-06-27T00:00:00Z"
 REPLAY_TO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+SAMPLE_LATEST_OCCURRED_AT="2026-06-27T10:15:00Z"
+if [[ "$REPLAY_TO" < "$SAMPLE_LATEST_OCCURRED_AT" ]]; then
+  REPLAY_TO="2026-06-27T23:59:59Z"
+  echo "    (current UTC is before sample occurred_at; using end-of-day replay window)"
+fi
+echo "    replay window: $REPLAY_FROM → $REPLAY_TO"
 REPLAY=$(curl -s -X POST "$API/v1/subscriptions/$ID1/replay" \
   -H 'Content-Type: application/json' \
   -d "{\"from\": \"$REPLAY_FROM\", \"to\": \"$REPLAY_TO\"}")
@@ -111,4 +120,4 @@ sleep 5
 echo "==> Audit by event after replay (order) — expect another attempt for AT_LEAST_ONCE"
 curl -s "$API/v1/audit/events/$EVENT1" | jq .
 
-echo "==> Done. Subscription IDs: $ID1, $ID2, $ID3"
+echo "==> Done."
