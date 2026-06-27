@@ -1,0 +1,68 @@
+spring:
+  application:
+    name: event-driven-notification-fanout-service
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:fanout}
+    username: ${DB_USER:fanout}
+    password: ${DB_PASSWORD:fanout}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    listener:
+      ack-mode: manual
+    consumer:
+      group-id: fanout-ingest
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+
+server:
+  port: ${SERVER_PORT:8080}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: when_authorized
+  metrics:
+    tags:
+      application: ${spring.application.name}
+  tracing:
+    sampling:
+      probability: 1.0
+  otlp:
+    tracing:
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318/v1/traces}
+
+fanout:
+  kafka:
+    inbound-topic: ${KAFKA_INBOUND_TOPIC:events.inbound}
+    delivery-topic: ${KAFKA_DELIVERY_TOPIC:deliveries.pending}
+    dlq-topic: ${KAFKA_DLQ_TOPIC:events.inbound.dlq}
+  delivery:
+    scheduler-interval-ms: ${DELIVERY_SCHEDULER_INTERVAL_MS:5000}
+    worker-poll-interval-ms: ${DELIVERY_WORKER_POLL_MS:1000}
+  subscription-cache-ttl-seconds: ${SUBSCRIPTION_CACHE_TTL:30}
+
+logging:
+  level:
+    root: INFO
+    com.eventdriven.notification.fanout: INFO
+    org.springframework.kafka: WARN
