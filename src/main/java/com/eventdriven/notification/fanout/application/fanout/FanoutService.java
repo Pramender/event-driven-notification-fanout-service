@@ -1,18 +1,14 @@
 package com.eventdriven.notification.fanout.application.fanout;
 
+import com.eventdriven.notification.fanout.application.delivery.DeliveryEnqueueService;
 import com.eventdriven.notification.fanout.application.filter.FilterEvaluator;
 import com.eventdriven.notification.fanout.application.logging.LogActions;
 import com.eventdriven.notification.fanout.application.logging.LogStatus;
 import com.eventdriven.notification.fanout.application.logging.StructuredLog;
 import com.eventdriven.notification.fanout.application.metrics.FanoutMetrics;
 import com.eventdriven.notification.fanout.application.subscription.SubscriptionCache;
-import com.eventdriven.notification.fanout.domain.DeliveryStatus;
 import com.eventdriven.notification.fanout.domain.InboundEvent;
 import com.eventdriven.notification.fanout.domain.Subscription;
-import com.eventdriven.notification.fanout.infrastructure.persistence.entity.SubscriptionDeliveryCursorEntity;
-import com.eventdriven.notification.fanout.infrastructure.persistence.entity.SubscriptionDeliveryEntity;
-import com.eventdriven.notification.fanout.infrastructure.persistence.repository.SubscriptionDeliveryCursorJpaRepository;
-import com.eventdriven.notification.fanout.infrastructure.persistence.repository.SubscriptionDeliveryJpaRepository;
 import io.micrometer.tracing.Span;
 import io.micrometer.tracing.Tracer;
 import org.slf4j.Logger;
@@ -20,9 +16,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.Instant;
 import java.util.List;
-import java.util.UUID;
 
 /**
  * Evaluates active subscriptions against an event and enqueues per-subscriber deliveries with FIFO sequence numbers.
@@ -34,22 +28,19 @@ public class FanoutService {
 
     private final SubscriptionCache subscriptionCache;
     private final FilterEvaluator filterEvaluator;
-    private final SubscriptionDeliveryJpaRepository deliveryRepository;
-    private final SubscriptionDeliveryCursorJpaRepository cursorRepository;
+    private final DeliveryEnqueueService deliveryEnqueueService;
     private final FanoutMetrics metrics;
     private final Tracer tracer;
 
     public FanoutService(
             SubscriptionCache subscriptionCache,
             FilterEvaluator filterEvaluator,
-            SubscriptionDeliveryJpaRepository deliveryRepository,
-            SubscriptionDeliveryCursorJpaRepository cursorRepository,
+            DeliveryEnqueueService deliveryEnqueueService,
             FanoutMetrics metrics,
             Tracer tracer) {
         this.subscriptionCache = subscriptionCache;
         this.filterEvaluator = filterEvaluator;
-        this.deliveryRepository = deliveryRepository;
-        this.cursorRepository = cursorRepository;
+        this.deliveryEnqueueService = deliveryEnqueueService;
         this.metrics = metrics;
         this.tracer = tracer;
     }
@@ -94,33 +85,6 @@ public class FanoutService {
     }
 
     private void createQueuedDelivery(InboundEvent event, Subscription subscription) {
-        UUID subscriptionId = subscription.subscriptionId();
-        SubscriptionDeliveryCursorEntity cursor = cursorRepository.findForUpdate(subscriptionId)
-                .orElseGet(() -> initializeCursor(subscriptionId));
-
-        long sequenceNumber = cursor.getNextAssignSeq();
-        cursor.setNextAssignSeq(sequenceNumber + 1);
-        cursor.setUpdatedAt(Instant.now());
-        cursorRepository.save(cursor);
-
-        SubscriptionDeliveryEntity delivery = new SubscriptionDeliveryEntity();
-        delivery.setDeliveryId(UUID.randomUUID());
-        delivery.setEventId(event.eventId());
-        delivery.setSubscriptionId(subscriptionId);
-        delivery.setSequenceNumber(sequenceNumber);
-        delivery.setStatus(DeliveryStatus.QUEUED.name());
-        delivery.setAttemptCount(0);
-        delivery.setCreatedAt(Instant.now());
-        delivery.setUpdatedAt(Instant.now());
-        deliveryRepository.save(delivery);
-    }
-
-    private SubscriptionDeliveryCursorEntity initializeCursor(UUID subscriptionId) {
-        SubscriptionDeliveryCursorEntity cursor = new SubscriptionDeliveryCursorEntity();
-        cursor.setSubscriptionId(subscriptionId);
-        cursor.setNextDeliverableSeq(1);
-        cursor.setNextAssignSeq(1);
-        cursor.setUpdatedAt(Instant.now());
-        return cursorRepository.save(cursor);
+        deliveryEnqueueService.enqueue(subscription.subscriptionId(), event.eventId());
     }
 }

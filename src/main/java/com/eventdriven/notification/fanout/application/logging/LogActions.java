@@ -13,6 +13,7 @@ public final class LogActions {
     public static final String DELIVERY_SCHEDULER = "delivery.scheduler";
     public static final String WEBHOOK_REQUEST = "webhook.request";
     public static final String HTTP_ERROR = "http.error";
+    public static final String REPLAY = "subscription.replay";
 
     private LogActions() {
     }

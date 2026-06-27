@@ -46,4 +46,6 @@ public interface SubscriptionDeliveryJpaRepository extends JpaRepository<Subscri
     List<SubscriptionDeliveryEntity> findReadyForDispatch(@Param("now") Instant now, @Param("limit") int limit);
 
     boolean existsByEventIdAndSubscriptionIdAndStatus(UUID eventId, UUID subscriptionId, String status);
+
+    Optional<SubscriptionDeliveryEntity> findByEventIdAndSubscriptionId(UUID eventId, UUID subscriptionId);
 }

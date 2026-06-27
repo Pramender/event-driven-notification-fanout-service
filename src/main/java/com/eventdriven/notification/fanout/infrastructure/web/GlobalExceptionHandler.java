@@ -57,6 +57,14 @@ public class GlobalExceptionHandler {
         return detail;
     }
 
+    @ExceptionHandler(ReplayValidationException.class)
+    public ProblemDetail handleReplay(ReplayValidationException ex) {
+        ProblemDetail detail = ProblemDetail.forStatus(HttpStatus.BAD_REQUEST);
+        detail.setTitle("Invalid replay request");
+        detail.setDetail(ex.getMessage());
+        return detail;
+    }
+
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ProblemDetail handleBeanValidation(MethodArgumentNotValidException ex) {
         String fieldErrors = ex.getBindingResult().getFieldErrors().stream()

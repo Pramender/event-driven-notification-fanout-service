@@ -56,6 +56,15 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
+    void mapsReplayValidationTo400() {
+        ProblemDetail detail = handler.handleReplay(new ReplayValidationException("'from' must be less than or equal to 'to'"));
+
+        assertThat(detail.getStatus()).isEqualTo(HttpStatus.BAD_REQUEST.value());
+        assertThat(detail.getTitle()).isEqualTo("Invalid replay request");
+        assertThat(detail.getDetail()).contains("from");
+    }
+
+    @Test
     void mapsBeanValidationTo400WithFieldDetails() throws Exception {
         BeanPropertyBindingResult bindingResult = new BeanPropertyBindingResult(new Object(), "request");
         bindingResult.addError(new FieldError("request", "type", "must not be blank"));

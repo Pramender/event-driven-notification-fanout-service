@@ -4,6 +4,7 @@ import com.eventdriven.notification.fanout.application.delivery.DeliveryOrchestr
 import com.eventdriven.notification.fanout.domain.DeliveryStatus;
 import com.eventdriven.notification.fanout.infrastructure.web.dto.AcceptEventResponse;
 import com.eventdriven.notification.fanout.infrastructure.web.dto.DeliveryAuditResponse;
+import com.eventdriven.notification.fanout.infrastructure.web.dto.ReplayEventsResponse;
 import com.eventdriven.notification.fanout.infrastructure.web.dto.SubscriptionResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.tomakehurst.wiremock.WireMockServer;
@@ -90,6 +91,7 @@ class ControllerApiIT {
         registry.add("management.tracing.enabled", () -> "false");
         registry.add("spring.kafka.listener.auto-startup", () -> "false");
         registry.add("fanout.delivery.worker-poll-interval-ms", () -> "60000");
+        registry.add("fanout.delivery.scheduler-interval-ms", () -> "60000");
     }
 
     @Test
@@ -286,6 +288,7 @@ class ControllerApiIT {
                 String.class);
         assertThat(invalidStatus.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(invalidStatus.getBody()).contains("status");
+        deleteSubscription(subscription.subscriptionId());
     }
 
     @Test
@@ -369,6 +372,116 @@ class ControllerApiIT {
                 createResponse.getBody().subscriptionId(), "FAILED");
         assertThat(failed).hasSize(1);
         assertThat(failed.getFirst().eventId()).isEqualTo(event.eventId());
+    }
+
+    @Test
+    void replayApiAcceptsTimeRangeAndRedeliversEvents() throws Exception {
+        webhookServer.resetAll();
+        stubFor(post(urlEqualTo("/replay-api"))
+                .willReturn(aResponse().withStatus(200)));
+
+        String subscriptionBody = """
+                {
+                  "name": "replay-api-sub",
+                  "deliveryMode": "AT_LEAST_ONCE",
+                  "filter": { "all": [ { "field": "type", "op": "eq", "value": "replay.api.event" } ] },
+                  "target": { "url": "%s/replay-api", "timeoutMs": 3000 },
+                  "retryPolicy": { "maxAttempts": 3, "initialBackoffMs": 100, "maxBackoffMs": 500, "multiplier": 2.0 }
+                }
+                """.formatted("http://localhost:" + webhookServer.port());
+        SubscriptionResponse subscription = restTemplate.exchange(
+                apiUrl("/v1/subscriptions"),
+                HttpMethod.POST,
+                jsonEntity(subscriptionBody),
+                SubscriptionResponse.class).getBody();
+
+        postEventRawSuccess("""
+                {
+                  "type": "replay.api.event",
+                  "source": "orders-api",
+                  "occurred_at": "2026-06-27T10:30:00Z",
+                  "payload": { "amount": 150 }
+                }
+                """);
+
+        await().untilAsserted(() -> {
+            deliveryOrchestrator.processReadyDeliveries();
+            verify(1, postRequestedFor(urlEqualTo("/replay-api")));
+        });
+
+        ResponseEntity<ReplayEventsResponse> replayResponse = restTemplate.exchange(
+                apiUrl("/v1/subscriptions/" + subscription.subscriptionId() + "/replay"),
+                HttpMethod.POST,
+                jsonEntity("""
+                        {
+                          "from": "2026-06-27T10:00:00Z",
+                          "to": "2026-06-27T12:00:00Z"
+                        }
+                        """),
+                ReplayEventsResponse.class);
+        assertThat(replayResponse.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+        assertThat(replayResponse.getBody().subscriptionId()).isEqualTo(subscription.subscriptionId());
+        assertThat(replayResponse.getBody().matched()).isEqualTo(1);
+        assertThat(replayResponse.getBody().queued()).isEqualTo(1);
+
+        await().untilAsserted(() -> {
+            deliveryOrchestrator.processReadyDeliveries();
+            verify(2, postRequestedFor(urlEqualTo("/replay-api")));
+        });
+
+        deleteSubscription(subscription.subscriptionId());
+    }
+
+    @Test
+    void replayApiReturnsProblemDetailsForInvalidRequests() {
+        UUID missing = UUID.randomUUID();
+        ResponseEntity<String> notFound = restTemplate.exchange(
+                apiUrl("/v1/subscriptions/" + missing + "/replay"),
+                HttpMethod.POST,
+                jsonEntity("""
+                        {
+                          "from": "2026-06-27T10:00:00Z",
+                          "to": "2026-06-27T12:00:00Z"
+                        }
+                        """),
+                String.class);
+        assertThat(notFound.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(notFound.getBody()).contains("Subscription not found");
+
+        SubscriptionResponse subscription = restTemplate.exchange(
+                apiUrl("/v1/subscriptions"),
+                HttpMethod.POST,
+                jsonEntity("""
+                        {
+                          "name": "replay-errors",
+                          "deliveryMode": "AT_LEAST_ONCE",
+                          "filter": { "all": [] },
+                          "target": { "url": "http://localhost:1/hook", "timeoutMs": 1000 },
+                          "retryPolicy": { "maxAttempts": 3, "initialBackoffMs": 100, "maxBackoffMs": 500, "multiplier": 2.0 }
+                        }
+                        """),
+                SubscriptionResponse.class).getBody();
+
+        ResponseEntity<String> invalidRange = restTemplate.exchange(
+                apiUrl("/v1/subscriptions/" + subscription.subscriptionId() + "/replay"),
+                HttpMethod.POST,
+                jsonEntity("""
+                        {
+                          "from": "2026-06-27T12:00:00Z",
+                          "to": "2026-06-27T10:00:00Z"
+                        }
+                        """),
+                String.class);
+        assertThat(invalidRange.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(invalidRange.getBody()).contains("Invalid replay request");
+
+        ResponseEntity<String> missingFields = restTemplate.exchange(
+                apiUrl("/v1/subscriptions/" + subscription.subscriptionId() + "/replay"),
+                HttpMethod.POST,
+                jsonEntity("{}"),
+                String.class);
+        assertThat(missingFields.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(missingFields.getBody()).contains("Validation failed");
     }
 
     private SubscriptionResponse createSubscription(String samplePath) throws IOException {

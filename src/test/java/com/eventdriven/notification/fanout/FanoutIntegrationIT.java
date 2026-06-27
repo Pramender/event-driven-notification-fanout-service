@@ -4,6 +4,8 @@ import com.eventdriven.notification.fanout.application.audit.AuditService;
 import com.eventdriven.notification.fanout.application.audit.DeliveryAuditView;
 import com.eventdriven.notification.fanout.application.delivery.DeliveryOrchestrator;
 import com.eventdriven.notification.fanout.application.ingest.EventIngestService;
+import com.eventdriven.notification.fanout.application.replay.ReplayResult;
+import com.eventdriven.notification.fanout.application.replay.ReplayService;
 import com.eventdriven.notification.fanout.application.subscription.SubscriptionService;
 import com.eventdriven.notification.fanout.domain.DeliveryMode;
 import com.eventdriven.notification.fanout.domain.DeliveryStatus;
@@ -25,6 +27,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -61,6 +64,9 @@ class FanoutIntegrationIT {
     AuditService auditService;
 
     @Autowired
+    ReplayService replayService;
+
+    @Autowired
     ObjectMapper objectMapper;
 
     @BeforeAll
@@ -85,6 +91,8 @@ class FanoutIntegrationIT {
         registry.add("spring.kafka.bootstrap-servers", kafka::getBootstrapServers);
         registry.add("management.tracing.enabled", () -> "false");
         registry.add("spring.kafka.listener.auto-startup", () -> "false");
+        registry.add("fanout.delivery.worker-poll-interval-ms", () -> "60000");
+        registry.add("fanout.delivery.scheduler-interval-ms", () -> "60000");
     }
 
     @Test
@@ -223,12 +231,64 @@ class FanoutIntegrationIT {
         deliveryOrchestrator.processReadyDeliveries();
         await().untilAsserted(() -> verify(1, postRequestedFor(urlEqualTo("/retry-hook"))));
 
-        deliveryOrchestrator.processReadyDeliveries();
         await().untilAsserted(() -> {
+            deliveryOrchestrator.processReadyDeliveries();
             List<DeliveryAuditView> audit = auditService.byEvent(event.eventId());
             assertThat(audit).hasSize(1);
             assertThat(audit.getFirst().finalStatus()).isEqualTo(DeliveryStatus.SENT);
             assertThat(audit.getFirst().attempts()).hasSizeGreaterThanOrEqualTo(2);
+        });
+    }
+
+    @Test
+    void replayRequeuesHistoricalEventsInTimeRange() throws Exception {
+        webhookServer.resetAll();
+        stubFor(post(urlEqualTo("/replay-hook"))
+                .willReturn(aResponse().withStatus(200)));
+
+        var filter = objectMapper.readTree("""
+                { "all": [ { "field": "type", "op": "eq", "value": "replay.service.event" } ] }
+                """);
+        var subscription = subscriptionService.create(
+                "replay-sub",
+                DeliveryMode.AT_LEAST_ONCE,
+                filter,
+                new WebhookTarget("http://localhost:" + webhookServer.port() + "/replay-hook", Map.of(), 3000),
+                new RetryPolicy(3, 100, 500, 2.0)
+        );
+
+        Instant windowStart = Instant.parse("2026-06-27T10:00:00Z");
+        Instant windowEnd = Instant.parse("2026-06-27T12:00:00Z");
+
+        ingestService.acceptEvent("""
+                {
+                  "type": "replay.service.event",
+                  "source": "replay-test",
+                  "occurred_at": "2026-06-27T10:30:00Z",
+                  "payload": { "order_id": "1" }
+                }
+                """);
+        ingestService.acceptEvent("""
+                {
+                  "type": "payment.completed",
+                  "source": "replay-test",
+                  "occurred_at": "2026-06-27T11:30:00Z",
+                  "payload": {}
+                }
+                """);
+
+        deliveryOrchestrator.processReadyDeliveries();
+        await().untilAsserted(() -> verify(1, postRequestedFor(urlEqualTo("/replay-hook"))));
+
+        ReplayResult result = replayService.replay(subscription.subscriptionId(), windowStart, windowEnd);
+        assertThat(result.eventsScanned()).isEqualTo(2);
+        assertThat(result.matched()).isEqualTo(1);
+        assertThat(result.queued()).isEqualTo(1);
+        assertThat(result.skipped()).isZero();
+
+        await().untilAsserted(() -> {
+            deliveryOrchestrator.processReadyDeliveries();
+            verify(2, postRequestedFor(urlEqualTo("/replay-hook")));
         });
     }
 }
