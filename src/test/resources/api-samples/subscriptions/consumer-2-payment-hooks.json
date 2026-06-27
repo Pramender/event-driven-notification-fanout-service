@@ -1,0 +1,22 @@
+{
+  "name": "payment-hooks",
+  "deliveryMode": "AT_LEAST_ONCE",
+  "filter": {
+    "version": 1,
+    "all": [
+      { "field": "type", "op": "eq", "value": "payment.completed" },
+      { "field": "source", "op": "eq", "value": "payments-api" }
+    ]
+  },
+  "target": {
+    "url": "{{WEBHOOK_URL}}/consumer-2",
+    "headers": { "X-Consumer": "payment-hooks" },
+    "timeoutMs": 5000
+  },
+  "retryPolicy": {
+    "maxAttempts": 3,
+    "initialBackoffMs": 500,
+    "maxBackoffMs": 10000,
+    "multiplier": 2.0
+  }
+}

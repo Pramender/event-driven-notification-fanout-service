@@ -2,11 +2,15 @@ package com.eventdriven.notification.fanout.application.ingest;
 
 import com.eventdriven.notification.fanout.application.exception.EventValidationException;
 import com.eventdriven.notification.fanout.application.fanout.FanoutService;
+import com.eventdriven.notification.fanout.application.logging.LogActions;
+import com.eventdriven.notification.fanout.application.logging.LogStatus;
+import com.eventdriven.notification.fanout.application.logging.StructuredLog;
 import com.eventdriven.notification.fanout.application.metrics.FanoutMetrics;
 import com.eventdriven.notification.fanout.domain.InboundEvent;
 import com.eventdriven.notification.fanout.infrastructure.persistence.EntityMapper;
 import com.eventdriven.notification.fanout.infrastructure.persistence.entity.EventEntity;
 import com.eventdriven.notification.fanout.infrastructure.persistence.repository.EventJpaRepository;
+import com.eventdriven.notification.fanout.infrastructure.web.dto.AcceptEventRequest;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.tracing.Span;
@@ -57,31 +61,66 @@ public class EventIngestService {
         try (Tracer.SpanInScope ignored = tracer.withSpan(span)) {
             JsonNode root = parseJson(rawJson);
             InboundEvent event = validateAndBuild(root);
-            Optional<EventEntity> existing = eventRepository.findById(event.eventId());
-            if (existing.isPresent()) {
-                log.info("Duplicate event ingest ignored for eventId={}", event.eventId());
-                return mapper.toDomain(existing.get());
-            }
-
-            EventEntity entity = new EventEntity();
-            entity.setEventId(event.eventId());
-            entity.setEventType(event.type());
-            entity.setSource(event.source());
-            entity.setPayload(mapper.writeJson(event.payload()));
-            entity.setOccurredAt(event.occurredAt());
-            entity.setReceivedAt(event.receivedAt());
-            entity.setTraceId(span.context().traceId());
-            eventRepository.save(entity);
-
-            metrics.eventAccepted(event.type(), event.source());
-            log.info("Event accepted type={} source={} eventId={}", event.type(), event.source(), event.eventId());
-
-            InboundEvent persisted = mapper.toDomain(entity);
-            fanoutService.fanout(persisted);
-            return persisted;
+            return persistAndFanout(event, span.context().traceId());
         } finally {
             span.end();
         }
+    }
+
+    @Transactional
+    public InboundEvent acceptEvent(AcceptEventRequest request) {
+        Span span = tracer.nextSpan().name("event.accept").start();
+        try (Tracer.SpanInScope ignored = tracer.withSpan(span)) {
+            InboundEvent event = new InboundEvent(
+                    request.eventId() != null ? request.eventId() : UUID.randomUUID(),
+                    request.type(),
+                    request.source(),
+                    request.payload(),
+                    request.occurredAt(),
+                    Instant.now(),
+                    span.context().traceId()
+            );
+            return persistAndFanout(event, span.context().traceId());
+        } finally {
+            span.end();
+        }
+    }
+
+    private InboundEvent persistAndFanout(InboundEvent event, String traceId) {
+        Optional<EventEntity> existing = eventRepository.findById(event.eventId());
+        if (existing.isPresent()) {
+            StructuredLog.at(log)
+                    .action(LogActions.EVENT_ACCEPT)
+                    .status(LogStatus.DUPLICATE)
+                    .field("eventId", event.eventId())
+                    .message("Duplicate event ignored")
+                    .log();
+            return mapper.toDomain(existing.get());
+        }
+
+        EventEntity entity = new EventEntity();
+        entity.setEventId(event.eventId());
+        entity.setEventType(event.type());
+        entity.setSource(event.source());
+        entity.setPayload(mapper.writeJson(event.payload()));
+        entity.setOccurredAt(event.occurredAt());
+        entity.setReceivedAt(event.receivedAt());
+        entity.setTraceId(traceId);
+        eventRepository.save(entity);
+
+        metrics.eventAccepted(event.type(), event.source());
+        StructuredLog.at(log)
+                .action(LogActions.EVENT_ACCEPT)
+                .status(LogStatus.SUCCESS)
+                .field("eventId", event.eventId())
+                .field("type", event.type())
+                .field("source", event.source())
+                .message("Event accepted")
+                .log();
+
+        InboundEvent persisted = mapper.toDomain(entity);
+        fanoutService.fanout(persisted);
+        return persisted;
     }
 
     private JsonNode parseJson(String rawJson) {
@@ -106,9 +145,7 @@ public class EventIngestService {
                 ? UUID.fromString(root.get("event_id").asText())
                 : UUID.randomUUID();
 
-        Instant occurredAt = root.hasNonNull("occurred_at")
-                ? Instant.parse(root.get("occurred_at").asText())
-                : null;
+        Instant occurredAt = parseOccurredAt(root);
 
         return new InboundEvent(
                 eventId,
@@ -119,6 +156,19 @@ public class EventIngestService {
                 Instant.now(),
                 null
         );
+    }
+
+    private Instant parseOccurredAt(JsonNode root) {
+        JsonNode node = root.get("occurred_at");
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        if (node.isNumber()) {
+            double epoch = node.asDouble();
+            long epochMillis = epoch >= 1_000_000_000_000L ? (long) epoch : (long) (epoch * 1000);
+            return Instant.ofEpochMilli(epochMillis);
+        }
+        return Instant.parse(node.asText());
     }
 
     private String requiredText(JsonNode node, String field) {

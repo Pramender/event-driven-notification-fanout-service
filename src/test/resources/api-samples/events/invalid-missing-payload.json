@@ -1,0 +1,4 @@
+{
+  "type": "order.created",
+  "source": "orders-api"
+}

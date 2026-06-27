@@ -1,6 +1,9 @@
 package com.eventdriven.notification.fanout.application.fanout;
 
 import com.eventdriven.notification.fanout.application.filter.FilterEvaluator;
+import com.eventdriven.notification.fanout.application.logging.LogActions;
+import com.eventdriven.notification.fanout.application.logging.LogStatus;
+import com.eventdriven.notification.fanout.application.logging.StructuredLog;
 import com.eventdriven.notification.fanout.application.metrics.FanoutMetrics;
 import com.eventdriven.notification.fanout.application.subscription.SubscriptionCache;
 import com.eventdriven.notification.fanout.domain.DeliveryStatus;
@@ -66,13 +69,24 @@ public class FanoutService {
                     createQueuedDelivery(event, subscription);
                     metrics.fanoutMatch(subscription.subscriptionId().toString());
                     matchCount++;
-                    log.info("Event matched subscription eventId={} subscriptionId={}",
-                            event.eventId(), subscription.subscriptionId());
+                    StructuredLog.at(log)
+                            .action(LogActions.FANOUT_MATCH)
+                            .status(LogStatus.SUCCESS)
+                            .field("eventId", event.eventId())
+                            .field("subscriptionId", subscription.subscriptionId())
+                            .message("Event matched subscription")
+                            .log();
                 } finally {
                     matchSpan.end();
                 }
             }
-            log.info("Fanout complete eventId={} matches={}", event.eventId(), matchCount);
+            StructuredLog.at(log)
+                    .action(LogActions.FANOUT_COMPLETE)
+                    .status(LogStatus.SUCCESS)
+                    .field("eventId", event.eventId())
+                    .field("matches", matchCount)
+                    .message("Fanout complete")
+                    .log();
             return matchCount;
         } finally {
             span.end();

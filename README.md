@@ -205,7 +205,16 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318/v1/traces
 
 ### Logging
 
-Structured JSON logs (Logstash encoder) with MDC fields: `traceId`, `eventId`, `subscriptionId`, `deliveryId`, `sequenceNumber`.
+Structured logs with consistent fields: `timestamp`, `action`, `status`, plus correlation IDs (`traceId`, `eventId`, `subscriptionId`, `deliveryId`, `sequenceNumber`).
+
+- **Local dev (default):** readable single-line console format with short stack traces on errors
+- **Production (`SPRING_PROFILES_ACTIVE=prod`):** JSON logs via Logstash encoder for log aggregation
+
+Example (dev console):
+
+```
+2026-06-27 10:14:32.123 ERROR action=delivery.dispatch status=FAILED event= delivery=abc-123 attempt=3 httpStatus=503 reason=HTTP 503 | Delivery permanently failed
+```
 
 ## Local development
 

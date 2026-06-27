@@ -2,12 +2,16 @@ package com.eventdriven.notification.fanout.infrastructure.delivery;
 
 import com.eventdriven.notification.fanout.application.exception.PermanentDeliveryException;
 import com.eventdriven.notification.fanout.application.exception.RetryableDeliveryException;
+import com.eventdriven.notification.fanout.application.logging.LogActions;
+import com.eventdriven.notification.fanout.application.logging.LogStatus;
+import com.eventdriven.notification.fanout.application.logging.StructuredLog;
 import com.eventdriven.notification.fanout.domain.InboundEvent;
 import com.eventdriven.notification.fanout.domain.Subscription;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
@@ -64,7 +68,14 @@ public class WebhookDeliveryClient {
             return new WebhookDeliveryResult(response.getStatusCode().value());
         } catch (HttpStatusCodeException ex) {
             int status = ex.getStatusCode().value();
-            log.debug("Webhook returned status={} url={}", status, target.url());
+            StructuredLog.at(log)
+                    .level(Level.DEBUG)
+                    .action(LogActions.WEBHOOK_REQUEST)
+                    .status(status >= 500 || status == 429 ? LogStatus.RETRY : LogStatus.FAILED)
+                    .field("httpStatus", status)
+                    .field("url", target.url())
+                    .message("Webhook returned non-success status")
+                    .log();
             if (status >= 500 || status == 429) {
                 throw new RetryableDeliveryException("HTTP " + status, status, ex);
             }

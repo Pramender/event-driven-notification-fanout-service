@@ -1,0 +1,22 @@
+{
+  "name": "inventory-alerts",
+  "deliveryMode": "AT_MOST_ONCE",
+  "filter": {
+    "version": 1,
+    "all": [
+      { "field": "source", "op": "eq", "value": "inventory-api" },
+      { "field": "payload.sku", "op": "exists", "value": true }
+    ]
+  },
+  "target": {
+    "url": "{{WEBHOOK_URL}}/consumer-3",
+    "headers": { "X-Consumer": "inventory-alerts" },
+    "timeoutMs": 3000
+  },
+  "retryPolicy": {
+    "maxAttempts": 2,
+    "initialBackoffMs": 200,
+    "maxBackoffMs": 2000,
+    "multiplier": 2.0
+  }
+}

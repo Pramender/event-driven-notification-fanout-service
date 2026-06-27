@@ -1,0 +1,296 @@
+package com.eventdriven.notification.fanout;
+
+import com.eventdriven.notification.fanout.application.delivery.DeliveryOrchestrator;
+import com.eventdriven.notification.fanout.domain.DeliveryStatus;
+import com.eventdriven.notification.fanout.infrastructure.web.dto.AcceptEventResponse;
+import com.eventdriven.notification.fanout.infrastructure.web.dto.DeliveryAuditResponse;
+import com.eventdriven.notification.fanout.infrastructure.web.dto.SubscriptionResponse;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.tomakehurst.wiremock.WireMockServer;
+import com.github.tomakehurst.wiremock.client.WireMock;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.http.*;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.KafkaContainer;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.List;
+import java.util.UUID;
+
+import static com.github.tomakehurst.wiremock.client.WireMock.*;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
+
+/**
+ * Exercises every REST controller endpoint over HTTP with three sample webhook consumers.
+ */
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@Testcontainers
+class ControllerApiIT {
+
+    @Container
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine")
+            .withDatabaseName("fanout")
+            .withUsername("fanout")
+            .withPassword("fanout");
+
+    @Container
+    static KafkaContainer kafka = new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.6.1"));
+
+    static WireMockServer webhookServer;
+
+    @LocalServerPort
+    int port;
+
+    @Autowired
+    TestRestTemplate restTemplate;
+
+    @Autowired
+    DeliveryOrchestrator deliveryOrchestrator;
+
+    @Autowired
+    ObjectMapper objectMapper;
+
+    @BeforeAll
+    static void startWebhook() {
+        webhookServer = new WireMockServer(0);
+        webhookServer.start();
+        WireMock.configureFor("localhost", webhookServer.port());
+        stubFor(post(urlMatching("/consumer-[1-3]"))
+                .willReturn(aResponse().withStatus(200)));
+    }
+
+    @AfterAll
+    static void stopWebhook() {
+        if (webhookServer != null) {
+            webhookServer.stop();
+        }
+    }
+
+    @DynamicPropertySource
+    static void registerProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", postgres::getJdbcUrl);
+        registry.add("spring.datasource.username", postgres::getUsername);
+        registry.add("spring.datasource.password", postgres::getPassword);
+        registry.add("spring.kafka.bootstrap-servers", kafka::getBootstrapServers);
+        registry.add("management.tracing.enabled", () -> "false");
+        registry.add("spring.kafka.listener.auto-startup", () -> "false");
+        registry.add("fanout.delivery.worker-poll-interval-ms", () -> "60000");
+    }
+
+    @Test
+    void allControllerEndpointsWithThreeConsumersAndEvents() throws Exception {
+        webhookServer.resetRequests();
+        stubFor(post(urlMatching("/consumer-[1-3]"))
+                .willReturn(aResponse().withStatus(200)));
+
+        SubscriptionResponse consumer1 = createSubscription("subscriptions/consumer-1-order-alerts.json");
+        SubscriptionResponse consumer2 = createSubscription("subscriptions/consumer-2-payment-hooks.json");
+        SubscriptionResponse consumer3 = createSubscription("subscriptions/consumer-3-inventory-alerts.json");
+
+        assertThat(consumer1.name()).isEqualTo("order-alerts");
+        assertThat(consumer1.enabled()).isTrue();
+        assertThat(consumer1.subscriptionId()).isNotNull();
+
+        SubscriptionResponse fetched = getSubscription(consumer1.subscriptionId());
+        assertThat(fetched.name()).isEqualTo("order-alerts");
+        assertThat(fetched.deliveryMode()).isEqualTo(consumer1.deliveryMode());
+
+        List<SubscriptionResponse> active = listSubscriptions();
+        assertThat(active)
+                .extracting(SubscriptionResponse::subscriptionId)
+                .contains(consumer1.subscriptionId(), consumer2.subscriptionId(), consumer3.subscriptionId());
+
+        AcceptEventResponse orderHigh = postEvent("events/order-created-high-value.json");
+        AcceptEventResponse orderLow = postEvent("events/order-created-low-value.json");
+        AcceptEventResponse payment = postEvent("events/payment-completed.json");
+        AcceptEventResponse inventory = postEvent("events/inventory-low-stock.json");
+
+        assertThat(orderHigh.eventId()).isEqualTo(UUID.fromString("11111111-1111-1111-1111-111111111111"));
+        assertThat(orderHigh.type()).isEqualTo("order.created");
+        assertThat(orderHigh.receivedAt()).isNotNull();
+
+        ResponseEntity<String> duplicate = postEventRaw("events/order-created-high-value.json");
+        assertThat(duplicate.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+
+        ResponseEntity<String> invalid = postEventRaw("events/invalid-missing-payload.json");
+        assertThat(invalid.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(invalid.getBody()).contains("payload");
+
+        dispatchUntilWebhooksReceived(3);
+
+        verify(postRequestedFor(urlEqualTo("/consumer-1")));
+        verify(postRequestedFor(urlEqualTo("/consumer-2")));
+        verify(postRequestedFor(urlEqualTo("/consumer-3")));
+        verify(0, postRequestedFor(urlEqualTo("/consumer-1"))
+                .withRequestBody(containing("ORD-1002")));
+
+        List<DeliveryAuditResponse> orderAudits = auditByEvent(orderHigh.eventId());
+        assertThat(orderAudits).hasSize(1);
+        assertThat(orderAudits.getFirst().subscriptionId()).isEqualTo(consumer1.subscriptionId());
+        assertThat(orderAudits.getFirst().finalStatus()).isEqualTo(DeliveryStatus.SENT);
+        assertThat(orderAudits.getFirst().attempts()).isNotEmpty();
+        assertThat(orderAudits.getFirst().attempts().getFirst().httpStatus()).isEqualTo(200);
+
+        UUID deliveryId = orderAudits.getFirst().deliveryId();
+        DeliveryAuditResponse deliveryAudit = auditByDelivery(deliveryId);
+        assertThat(deliveryAudit.eventId()).isEqualTo(orderHigh.eventId());
+        assertThat(deliveryAudit.sequenceNumber()).isEqualTo(1);
+
+        List<DeliveryAuditResponse> sentForConsumer2 = auditBySubscription(consumer2.subscriptionId(), "SENT");
+        assertThat(sentForConsumer2).hasSize(1);
+        assertThat(sentForConsumer2.getFirst().eventId()).isEqualTo(payment.eventId());
+
+        List<DeliveryAuditResponse> allForConsumer3 = auditBySubscription(consumer3.subscriptionId(), null);
+        assertThat(allForConsumer3).hasSize(1);
+        assertThat(allForConsumer3.getFirst().eventId()).isEqualTo(inventory.eventId());
+
+        List<DeliveryAuditResponse> noMatchForConsumer1 = auditBySubscription(consumer1.subscriptionId(), "FAILED");
+        assertThat(noMatchForConsumer1).isEmpty();
+
+        List<DeliveryAuditResponse> lowValueAudits = auditByEvent(orderLow.eventId());
+        assertThat(lowValueAudits).isEmpty();
+
+        deleteSubscription(consumer3.subscriptionId());
+        assertThat(getSubscriptionStatus(consumer3.subscriptionId())).isEqualTo(HttpStatus.NOT_FOUND);
+
+        List<SubscriptionResponse> afterDelete = listSubscriptions();
+        assertThat(afterDelete)
+                .extracting(SubscriptionResponse::subscriptionId)
+                .contains(consumer1.subscriptionId(), consumer2.subscriptionId())
+                .doesNotContain(consumer3.subscriptionId());
+    }
+
+    @Test
+    void subscriptionNotFoundReturns404() {
+        UUID missing = UUID.randomUUID();
+        assertThat(getSubscriptionStatus(missing)).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    private SubscriptionResponse createSubscription(String samplePath) throws IOException {
+        String body = loadSample(samplePath);
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        ResponseEntity<SubscriptionResponse> response = restTemplate.exchange(
+                apiUrl("/v1/subscriptions"),
+                HttpMethod.POST,
+                new HttpEntity<>(body, headers),
+                SubscriptionResponse.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        return response.getBody();
+    }
+
+    private SubscriptionResponse getSubscription(UUID subscriptionId) {
+        ResponseEntity<SubscriptionResponse> response = restTemplate.getForEntity(
+                apiUrl("/v1/subscriptions/" + subscriptionId),
+                SubscriptionResponse.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return response.getBody();
+    }
+
+    private HttpStatusCode getSubscriptionStatus(UUID subscriptionId) {
+        ResponseEntity<String> response = restTemplate.getForEntity(
+                apiUrl("/v1/subscriptions/" + subscriptionId),
+                String.class);
+        return response.getStatusCode();
+    }
+
+    private List<SubscriptionResponse> listSubscriptions() {
+        ResponseEntity<SubscriptionResponse[]> response = restTemplate.getForEntity(
+                apiUrl("/v1/subscriptions"),
+                SubscriptionResponse[].class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return Arrays.asList(response.getBody());
+    }
+
+    private void deleteSubscription(UUID subscriptionId) {
+        ResponseEntity<Void> response = restTemplate.exchange(
+                apiUrl("/v1/subscriptions/" + subscriptionId),
+                HttpMethod.DELETE,
+                HttpEntity.EMPTY,
+                Void.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+    }
+
+    private AcceptEventResponse postEvent(String samplePath) throws IOException {
+        ResponseEntity<AcceptEventResponse> response = restTemplate.exchange(
+                apiUrl("/v1/events"),
+                HttpMethod.POST,
+                jsonEntity(loadSample(samplePath)),
+                AcceptEventResponse.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+        return response.getBody();
+    }
+
+    private ResponseEntity<String> postEventRaw(String samplePath) throws IOException {
+        return restTemplate.exchange(
+                apiUrl("/v1/events"),
+                HttpMethod.POST,
+                jsonEntity(loadSample(samplePath)),
+                String.class);
+    }
+
+    private List<DeliveryAuditResponse> auditByEvent(UUID eventId) {
+        ResponseEntity<DeliveryAuditResponse[]> response = restTemplate.getForEntity(
+                apiUrl("/v1/audit/events/" + eventId),
+                DeliveryAuditResponse[].class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return Arrays.asList(response.getBody());
+    }
+
+    private List<DeliveryAuditResponse> auditBySubscription(UUID subscriptionId, String status) {
+        String path = status == null
+                ? "/v1/audit/subscriptions/" + subscriptionId
+                : "/v1/audit/subscriptions/" + subscriptionId + "?status=" + status;
+        ResponseEntity<DeliveryAuditResponse[]> response = restTemplate.getForEntity(
+                apiUrl(path),
+                DeliveryAuditResponse[].class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return Arrays.asList(response.getBody());
+    }
+
+    private DeliveryAuditResponse auditByDelivery(UUID deliveryId) {
+        ResponseEntity<DeliveryAuditResponse> response = restTemplate.getForEntity(
+                apiUrl("/v1/audit/deliveries/" + deliveryId),
+                DeliveryAuditResponse.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return response.getBody();
+    }
+
+    private void dispatchUntilWebhooksReceived(int expectedCount) {
+        await().untilAsserted(() -> {
+            deliveryOrchestrator.processReadyDeliveries();
+            verify(expectedCount, postRequestedFor(urlMatching("/consumer-[1-3]")));
+        });
+    }
+
+    private HttpEntity<String> jsonEntity(String body) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        return new HttpEntity<>(body, headers);
+    }
+
+    private String loadSample(String relativePath) throws IOException {
+        String raw = new ClassPathResource("api-samples/" + relativePath)
+                .getContentAsString(StandardCharsets.UTF_8);
+        return raw.replace("{{WEBHOOK_URL}}", "http://localhost:" + webhookServer.port());
+    }
+
+    private String apiUrl(String path) {
+        return "http://localhost:" + port + path;
+    }
+}

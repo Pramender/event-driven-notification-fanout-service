@@ -1,0 +1,12 @@
+{
+  "event_id": "33333333-3333-3333-3333-333333333333",
+  "type": "payment.completed",
+  "source": "payments-api",
+  "occurred_at": "2026-06-27T10:10:00Z",
+  "payload": {
+    "payment_id": "PAY-9001",
+    "order_id": "ORD-1001",
+    "amount": 250.00,
+    "method": "card"
+  }
+}

@@ -2,7 +2,10 @@ package com.eventdriven.notification.fanout.application.delivery;
 
 import com.eventdriven.notification.fanout.application.exception.PermanentDeliveryException;
 import com.eventdriven.notification.fanout.application.exception.RetryableDeliveryException;
+import com.eventdriven.notification.fanout.application.logging.LogActions;
+import com.eventdriven.notification.fanout.application.logging.LogStatus;
 import com.eventdriven.notification.fanout.application.logging.MdcContext;
+import com.eventdriven.notification.fanout.application.logging.StructuredLog;
 import com.eventdriven.notification.fanout.application.metrics.FanoutMetrics;
 import com.eventdriven.notification.fanout.application.subscription.SubscriptionCache;
 import com.eventdriven.notification.fanout.domain.*;
@@ -19,6 +22,7 @@ import io.micrometer.tracing.Span;
 import io.micrometer.tracing.Tracer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -83,7 +87,15 @@ public class DeliveryOrchestrator {
             try {
                 self.dispatchDelivery(delivery.getDeliveryId());
             } catch (Exception ex) {
-                log.error("Unexpected error dispatching deliveryId={}", delivery.getDeliveryId(), ex);
+                StructuredLog.at(log)
+                        .level(Level.ERROR)
+                        .action(LogActions.DELIVERY_DISPATCH)
+                        .status(LogStatus.FAILED)
+                        .field("deliveryId", delivery.getDeliveryId())
+                        .field("reason", ex.getMessage())
+                        .message("Unexpected dispatch error")
+                        .error(ex)
+                        .log();
             }
         }
     }
@@ -158,8 +170,14 @@ public class DeliveryOrchestrator {
 
             advanceHeadOfLine(delivery.getSubscriptionId(), delivery.getSequenceNumber());
             metrics.deliverySuccess(delivery.getSubscriptionId().toString());
-            log.info("Delivery succeeded deliveryId={} attempt={} httpStatus={}",
-                    deliveryId, attemptNumber, result.httpStatus());
+            StructuredLog.at(log)
+                    .action(LogActions.DELIVERY_DISPATCH)
+                    .status(LogStatus.SUCCESS)
+                    .field("deliveryId", deliveryId)
+                    .field("attempt", attemptNumber)
+                    .field("httpStatus", result.httpStatus())
+                    .message("Delivery succeeded")
+                    .log();
         } catch (RetryableDeliveryException ex) {
             handleFailure(delivery, attempt, startedAt, ex.getHttpStatus(), ex.getMessage(), true, subscription.retryPolicy());
         } catch (PermanentDeliveryException ex) {
@@ -199,8 +217,16 @@ public class DeliveryOrchestrator {
             delivery.setNextRetryAt(Instant.now().plusMillis(backoffMs));
             delivery.setUpdatedAt(Instant.now());
             deliveryRepository.save(delivery);
-            log.warn("Delivery retry scheduled deliveryId={} attempt={} nextRetryInMs={} reason={}",
-                    delivery.getDeliveryId(), attemptNumber, backoffMs, reason);
+            StructuredLog.at(log)
+                    .level(Level.WARN)
+                    .action(LogActions.DELIVERY_DISPATCH)
+                    .status(LogStatus.RETRY)
+                    .field("deliveryId", delivery.getDeliveryId())
+                    .field("attempt", attemptNumber)
+                    .field("nextRetryInMs", backoffMs)
+                    .field("reason", reason)
+                    .message("Delivery retry scheduled")
+                    .log();
         } else {
             DeliveryStateMachine.assertTransition(DeliveryStatus.IN_FLIGHT, DeliveryStatus.FAILED);
             attempt.setStatus(DeliveryStatus.FAILED.name());
@@ -209,8 +235,16 @@ public class DeliveryOrchestrator {
             markTerminal(delivery, DeliveryStatus.FAILED, httpStatus, reason);
             advanceHeadOfLine(delivery.getSubscriptionId(), delivery.getSequenceNumber());
             metrics.deliveryFailed(delivery.getSubscriptionId().toString());
-            log.error("Delivery permanently failed deliveryId={} attempt={} httpStatus={} reason={}",
-                    delivery.getDeliveryId(), attemptNumber, httpStatus, reason);
+            StructuredLog.at(log)
+                    .level(Level.ERROR)
+                    .action(LogActions.DELIVERY_DISPATCH)
+                    .status(LogStatus.FAILED)
+                    .field("deliveryId", delivery.getDeliveryId())
+                    .field("attempt", attemptNumber)
+                    .field("httpStatus", httpStatus)
+                    .field("reason", reason)
+                    .message("Delivery permanently failed")
+                    .log();
         }
     }
 
@@ -237,8 +271,14 @@ public class DeliveryOrchestrator {
             cursor.setNextDeliverableSeq(completedSequence + 1);
             cursor.setUpdatedAt(Instant.now());
             cursorRepository.save(cursor);
-            log.debug("Advanced head-of-line subscriptionId={} nextDeliverableSeq={}",
-                    subscriptionId, cursor.getNextDeliverableSeq());
+            StructuredLog.at(log)
+                    .level(Level.DEBUG)
+                    .action(LogActions.DELIVERY_DISPATCH)
+                    .status(LogStatus.SUCCESS)
+                    .field("subscriptionId", subscriptionId)
+                    .field("nextDeliverableSeq", cursor.getNextDeliverableSeq())
+                    .message("Head-of-line cursor advanced")
+                    .log();
         }
     }
 

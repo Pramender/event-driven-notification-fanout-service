@@ -1,0 +1,22 @@
+{
+  "name": "order-alerts",
+  "deliveryMode": "AT_LEAST_ONCE",
+  "filter": {
+    "version": 1,
+    "all": [
+      { "field": "type", "op": "eq", "value": "order.created" },
+      { "field": "payload.amount", "op": "gte", "value": 100 }
+    ]
+  },
+  "target": {
+    "url": "{{WEBHOOK_URL}}/consumer-1",
+    "headers": { "X-Consumer": "order-alerts" },
+    "timeoutMs": 5000
+  },
+  "retryPolicy": {
+    "maxAttempts": 5,
+    "initialBackoffMs": 1000,
+    "maxBackoffMs": 60000,
+    "multiplier": 2.0
+  }
+}

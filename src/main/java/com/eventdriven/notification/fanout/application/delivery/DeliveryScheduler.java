@@ -1,8 +1,11 @@
 package com.eventdriven.notification.fanout.application.delivery;
 
-import com.eventdriven.notification.fanout.config.FanoutProperties;
+import com.eventdriven.notification.fanout.application.logging.LogActions;
+import com.eventdriven.notification.fanout.application.logging.LogStatus;
+import com.eventdriven.notification.fanout.application.logging.StructuredLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -25,7 +28,14 @@ public class DeliveryScheduler {
         try {
             orchestrator.processReadyDeliveries();
         } catch (Exception ex) {
-            log.error("Delivery scheduler iteration failed", ex);
+            StructuredLog.at(log)
+                    .level(Level.ERROR)
+                    .action(LogActions.DELIVERY_SCHEDULER)
+                    .status(LogStatus.FAILED)
+                    .field("reason", ex.getMessage())
+                    .message("Delivery scheduler iteration failed")
+                    .error(ex)
+                    .log();
         }
     }
 }

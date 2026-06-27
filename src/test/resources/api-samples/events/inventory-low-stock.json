@@ -1,0 +1,11 @@
+{
+  "event_id": "44444444-4444-4444-4444-444444444444",
+  "type": "inventory.low_stock",
+  "source": "inventory-api",
+  "occurred_at": "2026-06-27T10:15:00Z",
+  "payload": {
+    "sku": "WIDGET-001",
+    "warehouse": "US-EAST",
+    "quantity_remaining": 3
+  }
+}

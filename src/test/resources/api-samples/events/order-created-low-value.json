@@ -1,0 +1,11 @@
+{
+  "event_id": "22222222-2222-2222-2222-222222222222",
+  "type": "order.created",
+  "source": "orders-api",
+  "occurred_at": "2026-06-27T10:05:00Z",
+  "payload": {
+    "order_id": "ORD-1002",
+    "amount": 25.00,
+    "currency": "USD"
+  }
+}
